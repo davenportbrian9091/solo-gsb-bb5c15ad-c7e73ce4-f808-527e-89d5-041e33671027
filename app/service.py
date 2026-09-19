@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from .schemas import WakeRequest, matrix_to_nested
 from .separation import (
+    Capacity,
+    CapacityViolation,
     ClosureConflict,
     ClosureWindow,
     Flight,
     TrialItem,
     Violation,
     build_matrix,
+    find_capacity_violations,
     find_closure_conflicts,
     find_violations,
     sort_flights,
@@ -48,6 +51,21 @@ def _build_runway_windows(req: WakeRequest) -> dict[str, list[ClosureWindow]]:
     return windows
 
 
+def _build_runway_capacities(req: WakeRequest) -> dict[str, Capacity | None]:
+    """Copy the optional rolling capacity config of every runway."""
+    capacities: dict[str, Capacity | None] = {}
+    for rw in req.runways:
+        capacities[rw.runway] = (
+            Capacity(
+                window_seconds=rw.capacity.window_seconds,
+                max_departures=rw.capacity.max_departures,
+            )
+            if rw.capacity is not None
+            else None
+        )
+    return capacities
+
+
 def _matrix_from_request(req: WakeRequest) -> dict[tuple[str, str], int]:
     if req.matrix is None:
         return build_matrix(None)
@@ -60,11 +78,14 @@ def run_validate(req: WakeRequest) -> tuple[
     dict[str, list[Flight]],
     dict[tuple[str, str], int],
     dict[str, list[ClosureWindow]],
+    dict[str, Capacity | None],
     dict[str, list[Violation]],
     dict[str, list[ClosureConflict]],
+    dict[str, list[CapacityViolation]],
 ]:
     payloads = _build_runway_flights(req)
     windows = _build_runway_windows(req)
+    capacities = _build_runway_capacities(req)
     matrix = _matrix_from_request(req)
     violations = {
         runway: find_violations(flights, matrix)
@@ -74,23 +95,29 @@ def run_validate(req: WakeRequest) -> tuple[
         runway: find_closure_conflicts(flights, windows[runway])
         for runway, flights in payloads.items()
     }
-    return payloads, matrix, windows, violations, conflicts
+    capacity_violations = {
+        runway: find_capacity_violations(flights, capacities[runway])
+        for runway, flights in payloads.items()
+    }
+    return payloads, matrix, windows, capacities, violations, conflicts, capacity_violations
 
 
 def run_trial(req: WakeRequest) -> tuple[
     dict[str, list[Flight]],
     dict[tuple[str, str], int],
     dict[str, list[ClosureWindow]],
+    dict[str, Capacity | None],
     dict[str, list[TrialItem]],
 ]:
     payloads = _build_runway_flights(req)
     windows = _build_runway_windows(req)
+    capacities = _build_runway_capacities(req)
     matrix = _matrix_from_request(req)
     trials = {
-        runway: trial_reschedule(flights, matrix, windows[runway])
+        runway: trial_reschedule(flights, matrix, windows[runway], capacities[runway])
         for runway, flights in payloads.items()
     }
-    return payloads, matrix, windows, trials
+    return payloads, matrix, windows, capacities, trials
 
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:

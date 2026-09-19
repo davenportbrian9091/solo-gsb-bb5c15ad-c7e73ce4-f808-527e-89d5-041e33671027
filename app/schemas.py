@@ -60,6 +60,21 @@ class ClosureWindowIn(BaseModel):
         return self
 
 
+class CapacityIn(BaseModel):
+    """Optional per-runway rolling departure capacity: at most
+    ``max_departures`` departures in any half-open window
+    ``[t, t + window_seconds)``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: int = Field(
+        ..., ge=1, description="滚动窗口长度（秒），正整数", examples=[600]
+    )
+    max_departures: int = Field(
+        ..., ge=1, description="单个滚动窗口内允许的最大离场架次，正整数", examples=[5]
+    )
+
+
 class RunwayIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +83,11 @@ class RunwayIn(BaseModel):
     closures: list[ClosureWindowIn] = Field(
         default_factory=list,
         description="本跑道的临时关闭窗口列表，[start, end) 左闭右开，彼此不得重叠。",
+    )
+    capacity: CapacityIn | None = Field(
+        default=None,
+        description="本跑道的滚动容量约束：任意 [t, t+window_seconds) 半开区间内"
+        "离场数不得超过 max_departures；缺省表示不限制。",
     )
 
     @field_validator("runway")
@@ -148,6 +168,22 @@ class ClosureWindowOut(BaseModel):
     end: datetime
 
 
+class CapacityOut(BaseModel):
+    window_seconds: int
+    max_departures: int
+
+
+class CapacityViolationOut(BaseModel):
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    position: int
+    window_start: datetime
+    window_end: datetime
+    departures_in_window: int
+    earliest_compliant_off: datetime
+
+
 class ClosureConflictOut(BaseModel):
     flight_no: str
     wake: Wake
@@ -177,10 +213,13 @@ class RunwayReportOut(BaseModel):
     order: list[str]
     total: int
     closures: list[ClosureWindowOut]
+    capacity: CapacityOut | None
     violation_count: int
     violations: list[ViolationOut]
     closure_conflict_count: int
     closure_conflicts: list[ClosureConflictOut]
+    capacity_violation_count: int
+    capacity_violations: list[CapacityViolationOut]
 
 
 class ValidateResponse(BaseModel):
@@ -191,6 +230,7 @@ class ValidateResponse(BaseModel):
     total_flights: int
     total_violations: int
     total_closure_conflicts: int
+    total_capacity_violations: int
     runways: list[RunwayReportOut]
 
 
@@ -204,6 +244,8 @@ class TrialItemOut(BaseModel):
     triggered_by: str | None
     closure_hit: bool
     closure_window: ClosureWindowOut | None
+    capacity_hit: bool
+    capacity_window: ClosureWindowOut | None
 
 
 class RunwayTrialOut(BaseModel):
@@ -211,6 +253,7 @@ class RunwayTrialOut(BaseModel):
     order: list[str]
     total: int
     closures: list[ClosureWindowOut]
+    capacity: CapacityOut | None
     delayed_count: int
     total_delay_seconds: int
     max_delay_seconds: int
@@ -247,6 +290,7 @@ class BatchResponse(BaseModel):
     total_flights: int
     total_violations: int | None = None
     total_closure_conflicts: int | None = None
+    total_capacity_violations: int | None = None
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
     runways: list[dict]
