@@ -85,6 +85,42 @@ class ClosureWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class Capacity:
+    """A rolling departure-capacity limit: at most ``max_departures`` flights
+    may depart in any half-open window of ``window_seconds`` seconds."""
+
+    window_seconds: int
+    max_departures: int
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityViolation:
+    """A flight whose addition makes some ``window_seconds`` span hold more
+    than ``max_departures`` departures, measured on the planned schedule.
+
+    The triggering window is anchored at the ``max_departures``-th flight
+    ahead of this one: ``[anchor_off, anchor_off + window_seconds)`` contains
+    ``max_departures + 1`` departures (the anchor flight and this flight at
+    its ends). ``earliest_compliant_off`` is the earliest instant at which
+    this flight may depart without breaching the rolling limit against the
+    flights ahead of it (``anchor_off + window_seconds``).
+    """
+
+    flight_no: str
+    wake: str
+    scheduled_off: datetime
+    position: int
+    window_seconds: int
+    max_departures: int
+    anchor_flight_no: str  # flight anchoring the triggering window (its start)
+    anchor_position: int
+    anchor_off: datetime  # triggering window start
+    window_end: datetime  # triggering window end (exclusive)
+    departures_in_window: int
+    earliest_compliant_off: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ClosureConflict:
     """A flight whose scheduled off-time falls inside a closure window."""
 
@@ -123,6 +159,12 @@ class TrialItem:
     triggered_by: str | None  # flight number of the leader that forced the pushback
     closure_hit: bool  # a closure window forced (further) delay
     closure_window: ClosureWindow | None  # the last window that pushed this flight
+    capacity_hit: bool = False  # the rolling capacity limit forced (further) delay
+    capacity_window_seconds: int | None = None
+    capacity_max_departures: int | None = None
+    capacity_anchor: str | None = None  # flight anchoring the capacity window
+    capacity_window_start: datetime | None = None  # [anchor_off, +window)
+    capacity_window_end: datetime | None = None
 
 
 def build_matrix(
@@ -218,20 +260,81 @@ def find_violations(
     return violations
 
 
+def find_capacity_violations(
+    flights: list[Flight], capacity: Capacity | None
+) -> list[CapacityViolation]:
+    """List departures that overflow the rolling capacity window.
+
+    With flights in stable order, any half-open span of ``window_seconds``
+    contains more than ``max_departures`` departures iff, for some flight at
+    position ``p``, the flight ``max_departures`` positions ahead of it (the
+    *anchor*, at index ``p - max_departures``) departs less than
+    ``window_seconds`` before it: that anchor's window
+    ``[t_anchor, t_anchor + window_seconds)`` then holds the anchor, the
+    flights in between, and this flight — at least ``max_departures + 1``
+    departures. Each overflowing flight is reported once with that window and
+    with its earliest compliant time ``t_anchor + window_seconds``.
+    Results follow the stable departure order.
+    """
+    if capacity is None:
+        return []
+    window_seconds = capacity.window_seconds
+    k = capacity.max_departures
+    ordered = sort_flights(flights)
+    violations: list[CapacityViolation] = []
+    for idx in range(k, len(ordered)):
+        anchor = ordered[idx - k]
+        flight = ordered[idx]
+        if flight.t - anchor.t < window_seconds:
+            window_end_t = anchor.t + window_seconds
+            # every flight from the anchor through this flight is inside
+            in_window = [
+                other
+                for other in ordered[idx - k : idx + 1]
+                if anchor.t <= other.t < window_end_t
+            ]
+            violations.append(
+                CapacityViolation(
+                    flight_no=flight.flight_no,
+                    wake=flight.wake,
+                    scheduled_off=flight.scheduled_off,
+                    position=idx + 1,
+                    window_seconds=window_seconds,
+                    max_departures=k,
+                    anchor_flight_no=anchor.flight_no,
+                    anchor_position=idx - k + 1,
+                    anchor_off=anchor.scheduled_off,
+                    window_end=datetime.fromtimestamp(window_end_t, tz=timezone.utc),
+                    departures_in_window=len(in_window),
+                    earliest_compliant_off=datetime.fromtimestamp(
+                        window_end_t, tz=timezone.utc
+                    ),
+                )
+            )
+    return violations
+
+
 def trial_reschedule(
     flights: list[Flight],
     matrix: dict[tuple[str, str], int],
     windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
 ) -> list[TrialItem]:
     """Greedily push flights back to the earliest safe time, keeping order.
 
     Every flight is placed at the earliest instant that (a) is not earlier
     than its scheduled time, (b) keeps at least the matrix gap behind the
-    (possibly already delayed) flight directly ahead of it, and (c) avoids
-    every closure window. If the wake-separation push lands the flight inside
-    a closure window, it is pushed further to that window's end — iterating
-    because a window end may coincide with the next window's start. Delays
-    cascade to successors. Original schedules are never rewritten; only
+    (possibly already delayed) flight directly ahead of it, (c) avoids every
+    closure window, and (d) keeps the runway's rolling capacity limit: no
+    half-open ``window_seconds`` span may already hold ``max_departures``
+    earlier departures (equivalently the ``max_departures``-th flight ahead
+    must depart at least ``window_seconds`` earlier). If the wake-separation
+    push lands the flight inside a closure window, it is pushed further to
+    that window's end — iterating because a window end may coincide with the
+    next window's start. A capacity push may likewise land inside a later
+    closure window, and a closure push is re-checked against capacity, so the
+    two constraints iterate together until both hold. Delays cascade to
+    successors. Original schedules are never rewritten; only
     :class:`TrialItem` proposals are returned.
     """
     ordered = sort_flights(flights)
@@ -250,13 +353,31 @@ def trial_reschedule(
                 triggered_by = prev.flight_no
         closure_hit = False
         closure_window: ClosureWindow | None = None
-        for window in wins:
-            if adjusted_t < window.s:
-                break  # in a gap before this (and every later) window
-            if window.contains(adjusted_t):
-                adjusted_t = window.e
-                closure_hit = True
-                closure_window = window
+        capacity_hit = False
+        capacity_anchor: Flight | None = None
+        capacity_window_t = 0
+        while True:
+            pushed = False
+            for window in wins:
+                if adjusted_t < window.s:
+                    break  # in a gap before this (and every later) window
+                if window.contains(adjusted_t):
+                    adjusted_t = window.e
+                    closure_hit = True
+                    closure_window = window
+                    pushed = True
+            if capacity is not None and position > capacity.max_departures:
+                anchor_item = items[position - 1 - capacity.max_departures]
+                anchor_t = to_epoch_seconds(anchor_item.adjusted_time)
+                earliest = anchor_t + capacity.window_seconds
+                if adjusted_t < earliest:
+                    adjusted_t = earliest
+                    capacity_hit = True
+                    capacity_anchor = anchor_item
+                    capacity_window_t = anchor_t
+                    pushed = True
+            if not pushed:
+                break
         items.append(
             TrialItem(
                 flight_no=flight.flight_no,
@@ -268,6 +389,29 @@ def trial_reschedule(
                 triggered_by=triggered_by,
                 closure_hit=closure_hit,
                 closure_window=closure_window,
+                capacity_hit=capacity_hit,
+                capacity_window_seconds=(
+                    capacity.window_seconds if capacity is not None else None
+                ),
+                capacity_max_departures=(
+                    capacity.max_departures if capacity is not None else None
+                ),
+                capacity_anchor=(
+                    capacity_anchor.flight_no if capacity_anchor is not None else None
+                ),
+                capacity_window_start=(
+                    datetime.fromtimestamp(capacity_window_t, tz=timezone.utc)
+                    if capacity_anchor is not None
+                    else None
+                ),
+                capacity_window_end=(
+                    datetime.fromtimestamp(
+                        capacity_window_t + capacity.window_seconds,
+                        tz=timezone.utc,
+                    )
+                    if capacity_anchor is not None and capacity is not None
+                    else None
+                ),
             )
         )
         prev = flight

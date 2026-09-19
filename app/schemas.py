@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .separation import DEFAULT_MATRIX, Wake
 
@@ -60,6 +67,29 @@ class ClosureWindowIn(BaseModel):
         return self
 
 
+class CapacityIn(BaseModel):
+    """A per-runway rolling departure-capacity limit.
+
+    In any half-open span of ``window_seconds`` seconds, at most
+    ``max_departures`` flights may depart.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_seconds: int = Field(
+        ...,
+        ge=1,
+        strict=True,
+        description="滚动窗口长度（秒），正整数",
+    )
+    max_departures: int = Field(
+        ...,
+        ge=1,
+        strict=True,
+        description="窗口内最多离场架次，正整数",
+    )
+
+
 class RunwayIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +98,11 @@ class RunwayIn(BaseModel):
     closures: list[ClosureWindowIn] = Field(
         default_factory=list,
         description="本跑道的临时关闭窗口列表，[start, end) 左闭右开，彼此不得重叠。",
+    )
+    capacity: CapacityIn | None = Field(
+        default=None,
+        description="本跑道可选的滚动离场容量约束：任意 window_seconds 秒的半开区间内"
+        "离场不得超过 max_departures 架；缺省表示不施加容量约束。",
     )
 
     @field_validator("runway")
@@ -148,6 +183,26 @@ class ClosureWindowOut(BaseModel):
     end: datetime
 
 
+class CapacityOut(BaseModel):
+    window_seconds: int
+    max_departures: int
+
+
+class CapacityViolationOut(BaseModel):
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    position: int
+    window_seconds: int
+    max_departures: int
+    departures_in_window: int
+    anchor_flight_no: str
+    anchor_position: int
+    window_start: datetime
+    window_end: datetime
+    earliest_compliant_off: datetime
+
+
 class ClosureConflictOut(BaseModel):
     flight_no: str
     wake: Wake
@@ -181,6 +236,36 @@ class RunwayReportOut(BaseModel):
     violations: list[ViolationOut]
     closure_conflict_count: int
     closure_conflicts: list[ClosureConflictOut]
+    # Capacity fields are emitted only when the runway carried a capacity
+    # config, so legacy request/response shapes stay byte-compatible.
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+    capacity_violation_count: int = 0
+    capacity_violations: list[CapacityViolationOut] = Field(default_factory=list)
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "order": self.order,
+            "total": self.total,
+            "closures": [w.model_dump() for w in self.closures],
+            "violation_count": self.violation_count,
+            "violations": [v.model_dump(mode="json") for v in self.violations],
+            "closure_conflict_count": self.closure_conflict_count,
+            "closure_conflicts": [
+                c.model_dump(mode="json") for c in self.closure_conflicts
+            ],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+            data["capacity_violation_count"] = self.capacity_violation_count
+            data["capacity_violations"] = [
+                v.model_dump(mode="json") for v in self.capacity_violations
+            ]
+        return data
 
 
 class ValidateResponse(BaseModel):
@@ -192,6 +277,26 @@ class ValidateResponse(BaseModel):
     total_violations: int
     total_closure_conflicts: int
     runways: list[RunwayReportOut]
+    # Same conditional rule as the per-runway capacity block: the summary is
+    # present only when at least one runway in the batch had a capacity config.
+    has_capacity: bool = Field(default=False, exclude=True)
+    total_capacity_violations: int = 0
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "matrix": self.matrix,
+            "total_runways": self.total_runways,
+            "total_flights": self.total_flights,
+            "total_violations": self.total_violations,
+            "total_closure_conflicts": self.total_closure_conflicts,
+            "runways": [rw.model_dump(mode="json") for rw in self.runways],
+        }
+        if self.has_capacity:
+            data["total_capacity_violations"] = self.total_capacity_violations
+        return data
 
 
 class TrialItemOut(BaseModel):
@@ -204,6 +309,42 @@ class TrialItemOut(BaseModel):
     triggered_by: str | None
     closure_hit: bool
     closure_window: ClosureWindowOut | None
+    # Capacity detail is present only when the runway carried a capacity config.
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity_hit: bool = False
+    capacity_window_seconds: int | None = None
+    capacity_max_departures: int | None = None
+    capacity_anchor: str | None = None
+    capacity_window: ClosureWindowOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "position": self.position,
+            "flight_no": self.flight_no,
+            "wake": self.wake,
+            "scheduled_off": self.scheduled_off,
+            "adjusted_off": self.adjusted_off,
+            "delay_seconds": self.delay_seconds,
+            "triggered_by": self.triggered_by,
+            "closure_hit": self.closure_hit,
+            "closure_window": (
+                self.closure_window.model_dump()
+                if self.closure_window is not None
+                else None
+            ),
+        }
+        if self.has_capacity:
+            data["capacity_hit"] = self.capacity_hit
+            data["capacity_window_seconds"] = self.capacity_window_seconds
+            data["capacity_max_departures"] = self.capacity_max_departures
+            data["capacity_anchor"] = self.capacity_anchor
+            data["capacity_window"] = (
+                self.capacity_window.model_dump()
+                if self.capacity_window is not None
+                else None
+            )
+        return data
 
 
 class RunwayTrialOut(BaseModel):
@@ -215,6 +356,26 @@ class RunwayTrialOut(BaseModel):
     total_delay_seconds: int
     max_delay_seconds: int
     items: list[TrialItemOut]
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "order": self.order,
+            "total": self.total,
+            "closures": [w.model_dump() for w in self.closures],
+            "delayed_count": self.delayed_count,
+            "total_delay_seconds": self.total_delay_seconds,
+            "max_delay_seconds": self.max_delay_seconds,
+            "items": [i.model_dump(mode="json") for i in self.items],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+        return data
 
 
 class TrialResponse(BaseModel):
@@ -247,6 +408,7 @@ class BatchResponse(BaseModel):
     total_flights: int
     total_violations: int | None = None
     total_closure_conflicts: int | None = None
+    total_capacity_violations: int | None = None
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
     runways: list[dict]

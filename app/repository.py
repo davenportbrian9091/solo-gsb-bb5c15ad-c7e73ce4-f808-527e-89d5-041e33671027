@@ -7,7 +7,15 @@ import sqlite3
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from .separation import ClosureConflict, ClosureWindow, Flight, TrialItem, Violation
+from .separation import (
+    Capacity,
+    CapacityViolation,
+    ClosureConflict,
+    ClosureWindow,
+    Flight,
+    TrialItem,
+    Violation,
+)
 from .timeutils import ensure_utc
 
 
@@ -32,8 +40,10 @@ def save_batch(
     matrix: dict[tuple[str, str], int],
     runway_payloads: dict[str, list[Flight]],
     closures_by_runway: dict[str, list[ClosureWindow]] | None = None,
+    capacities_by_runway: dict[str, Capacity] | None = None,
     violations_by_runway: dict[str, list[Violation]] | None = None,
     closure_conflicts_by_runway: dict[str, list[ClosureConflict]] | None = None,
+    capacity_violations_by_runway: dict[str, list[CapacityViolation]] | None = None,
     trial_by_runway: dict[str, list[TrialItem]] | None = None,
 ) -> str:
     batch_id = new_batch_id()
@@ -69,6 +79,18 @@ def save_batch(
                 " VALUES (?, ?, ?, ?, ?)",
                 (batch_id, runway, index, _iso(window.start), _iso(window.end)),
             )
+
+    for runway, capacity in (capacities_by_runway or {}).items():
+        conn.execute(
+            "INSERT INTO capacities (batch_id, runway, window_seconds, max_departures)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                batch_id,
+                runway,
+                capacity.window_seconds,
+                capacity.max_departures,
+            ),
+        )
 
     for runway, violations in (violations_by_runway or {}).items():
         for v in violations:
@@ -113,13 +135,41 @@ def save_batch(
                 ),
             )
 
+    for runway, cap_violations in (capacity_violations_by_runway or {}).items():
+        for cv in cap_violations:
+            conn.execute(
+                "INSERT INTO capacity_violations (batch_id, runway, position, flight_no, wake,"
+                " scheduled_off, window_seconds, max_departures, departures_in_window,"
+                " anchor_flight_no, anchor_position, window_start, window_end,"
+                " earliest_compliant_off)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    runway,
+                    cv.position,
+                    cv.flight_no,
+                    cv.wake,
+                    _iso(cv.scheduled_off),
+                    cv.window_seconds,
+                    cv.max_departures,
+                    cv.departures_in_window,
+                    cv.anchor_flight_no,
+                    cv.anchor_position,
+                    _iso(cv.anchor_off),
+                    _iso(cv.window_end),
+                    _iso(cv.earliest_compliant_off),
+                ),
+            )
+
     for runway, items in (trial_by_runway or {}).items():
         for item in items:
             conn.execute(
                 "INSERT INTO trial_items (batch_id, runway, position, flight_no, wake,"
                 " scheduled_off, adjusted_off, delay_seconds, triggered_by,"
-                " closure_hit, closure_window_start, closure_window_end)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " closure_hit, closure_window_start, closure_window_end,"
+                " capacity_hit, capacity_window_seconds, capacity_max_departures,"
+                " capacity_anchor, capacity_window_start, capacity_window_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     runway,
@@ -133,6 +183,14 @@ def save_batch(
                     int(item.closure_hit),
                     _iso(item.closure_window.start) if item.closure_window else None,
                     _iso(item.closure_window.end) if item.closure_window else None,
+                    int(item.capacity_hit),
+                    item.capacity_window_seconds,
+                    item.capacity_max_departures,
+                    item.capacity_anchor,
+                    _iso(item.capacity_window_start)
+                    if item.capacity_window_start
+                    else None,
+                    _iso(item.capacity_window_end) if item.capacity_window_end else None,
                 ),
             )
 
@@ -176,6 +234,19 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             {"start": _dt(cr["start_utc"]), "end": _dt(cr["end_utc"])}
         )
 
+    capacity_rows = conn.execute(
+        "SELECT runway, window_seconds, max_departures FROM capacities"
+        " WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchall()
+    capacities_by_runway: dict[str, dict] = {}
+    for cr in capacity_rows:
+        capacities_by_runway[cr["runway"]] = {
+            "window_seconds": cr["window_seconds"],
+            "max_departures": cr["max_departures"],
+        }
+    batch_has_capacity = bool(capacities_by_runway)
+
     if row["mode"] == "validate":
         vrows = conn.execute(
             "SELECT * FROM violations WHERE batch_id = ? ORDER BY runway, leader_position",
@@ -216,22 +287,49 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
                     "window_end": _dt(cr["window_end"]),
                 }
             )
+        cap_vrows = conn.execute(
+            "SELECT * FROM capacity_violations WHERE batch_id = ?"
+            " ORDER BY runway, position",
+            (batch_id,),
+        ).fetchall()
+        cap_violations_by_runway: dict[str, list[dict]] = {}
+        for cr in cap_vrows:
+            cap_violations_by_runway.setdefault(cr["runway"], []).append(
+                {
+                    "flight_no": cr["flight_no"],
+                    "wake": cr["wake"],
+                    "scheduled_off": _dt(cr["scheduled_off"]),
+                    "position": cr["position"],
+                    "window_seconds": cr["window_seconds"],
+                    "max_departures": cr["max_departures"],
+                    "departures_in_window": cr["departures_in_window"],
+                    "anchor_flight_no": cr["anchor_flight_no"],
+                    "anchor_position": cr["anchor_position"],
+                    "window_start": _dt(cr["window_start"]),
+                    "window_end": _dt(cr["window_end"]),
+                    "earliest_compliant_off": _dt(cr["earliest_compliant_off"]),
+                }
+            )
         for runway in order_by_runway:
             violations = violations_by_runway.get(runway, [])
             conflicts = conflicts_by_runway.get(runway, [])
-            runways.append(
-                {
-                    "runway": runway,
-                    "order": order_by_runway[runway],
-                    "total": len(order_by_runway[runway]),
-                    "closures": closures_by_runway.get(runway, []),
-                    "violation_count": len(violations),
-                    "violations": violations,
-                    "closure_conflict_count": len(conflicts),
-                    "closure_conflicts": conflicts,
-                }
-            )
-        return {
+            report = {
+                "runway": runway,
+                "order": order_by_runway[runway],
+                "total": len(order_by_runway[runway]),
+                "closures": closures_by_runway.get(runway, []),
+                "violation_count": len(violations),
+                "violations": violations,
+                "closure_conflict_count": len(conflicts),
+                "closure_conflicts": conflicts,
+            }
+            if runway in capacities_by_runway:
+                cap_violations = cap_violations_by_runway.get(runway, [])
+                report["capacity"] = capacities_by_runway[runway]
+                report["capacity_violation_count"] = len(cap_violations)
+                report["capacity_violations"] = cap_violations
+            runways.append(report)
+        result = {
             "batch_id": row["batch_id"],
             "mode": "validate",
             "created_at": row["created_at"],
@@ -244,6 +342,11 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             ),
             "runways": runways,
         }
+        if batch_has_capacity:
+            result["total_capacity_violations"] = sum(
+                len(v) for v in cap_violations_by_runway.values()
+            )
+        return result
 
     # trial
     trows = conn.execute(
@@ -258,19 +361,31 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
                 "start": _dt(tr["closure_window_start"]),
                 "end": _dt(tr["closure_window_end"]),
             }
-        items_by_runway.setdefault(tr["runway"], []).append(
-            {
-                "position": tr["position"],
-                "flight_no": tr["flight_no"],
-                "wake": tr["wake"],
-                "scheduled_off": _dt(tr["scheduled_off"]),
-                "adjusted_off": _dt(tr["adjusted_off"]),
-                "delay_seconds": tr["delay_seconds"],
-                "triggered_by": tr["triggered_by"],
-                "closure_hit": bool(tr["closure_hit"]),
-                "closure_window": closure_window,
-            }
-        )
+        item = {
+            "position": tr["position"],
+            "flight_no": tr["flight_no"],
+            "wake": tr["wake"],
+            "scheduled_off": _dt(tr["scheduled_off"]),
+            "adjusted_off": _dt(tr["adjusted_off"]),
+            "delay_seconds": tr["delay_seconds"],
+            "triggered_by": tr["triggered_by"],
+            "closure_hit": bool(tr["closure_hit"]),
+            "closure_window": closure_window,
+        }
+        runway_has_capacity = tr["runway"] in capacities_by_runway
+        if runway_has_capacity:
+            capacity_window = None
+            if tr["capacity_window_start"] is not None:
+                capacity_window = {
+                    "start": _dt(tr["capacity_window_start"]),
+                    "end": _dt(tr["capacity_window_end"]),
+                }
+            item["capacity_hit"] = bool(tr["capacity_hit"])
+            item["capacity_window_seconds"] = tr["capacity_window_seconds"]
+            item["capacity_max_departures"] = tr["capacity_max_departures"]
+            item["capacity_anchor"] = tr["capacity_anchor"]
+            item["capacity_window"] = capacity_window
+        items_by_runway.setdefault(tr["runway"], []).append(item)
     runways = []
     total_delayed = 0
     total_delay = 0
@@ -281,18 +396,19 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
         max_delay = max((i["delay_seconds"] for i in items), default=0)
         total_delayed += len(delayed)
         total_delay += rw_delay
-        runways.append(
-            {
-                "runway": runway,
-                "order": order_by_runway[runway],
-                "total": len(items),
-                "closures": closures_by_runway.get(runway, []),
-                "delayed_count": len(delayed),
-                "total_delay_seconds": rw_delay,
-                "max_delay_seconds": max_delay,
-                "items": items,
-            }
-        )
+        runway_report = {
+            "runway": runway,
+            "order": order_by_runway[runway],
+            "total": len(items),
+            "closures": closures_by_runway.get(runway, []),
+            "delayed_count": len(delayed),
+            "total_delay_seconds": rw_delay,
+            "max_delay_seconds": max_delay,
+            "items": items,
+        }
+        if runway in capacities_by_runway:
+            runway_report["capacity"] = capacities_by_runway[runway]
+        runways.append(runway_report)
     return {
         "batch_id": row["batch_id"],
         "mode": "trial",

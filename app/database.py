@@ -84,11 +84,40 @@ CREATE TABLE IF NOT EXISTS closure_conflicts (
     window_end    TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS capacities (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id       TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    runway         TEXT NOT NULL,
+    window_seconds INTEGER NOT NULL,
+    max_departures INTEGER NOT NULL,
+    UNIQUE(batch_id, runway)
+);
+
+CREATE TABLE IF NOT EXISTS capacity_violations (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id               TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    runway                 TEXT NOT NULL,
+    position               INTEGER NOT NULL,
+    flight_no              TEXT NOT NULL,
+    wake                   TEXT NOT NULL,
+    scheduled_off          TEXT NOT NULL,
+    window_seconds         INTEGER NOT NULL,
+    max_departures         INTEGER NOT NULL,
+    departures_in_window   INTEGER NOT NULL,
+    anchor_flight_no       TEXT NOT NULL,
+    anchor_position        INTEGER NOT NULL,
+    window_start           TEXT NOT NULL,
+    window_end             TEXT NOT NULL,
+    earliest_compliant_off TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_closures_batch ON closures(batch_id);
 CREATE INDEX IF NOT EXISTS idx_closure_conflicts_batch ON closure_conflicts(batch_id);
+CREATE INDEX IF NOT EXISTS idx_capacities_batch ON capacities(batch_id);
+CREATE INDEX IF NOT EXISTS idx_capacity_violations_batch ON capacity_violations(batch_id);
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -98,6 +127,13 @@ _TRIAL_ITEM_COLUMNS = {
     "closure_hit": "INTEGER NOT NULL DEFAULT 0",
     "closure_window_start": "TEXT",
     "closure_window_end": "TEXT",
+    # rolling-capacity support
+    "capacity_hit": "INTEGER NOT NULL DEFAULT 0",
+    "capacity_window_seconds": "INTEGER",
+    "capacity_max_departures": "INTEGER",
+    "capacity_anchor": "TEXT",
+    "capacity_window_start": "TEXT",
+    "capacity_window_end": "TEXT",
 }
 
 

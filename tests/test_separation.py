@@ -8,9 +8,11 @@ import pytest
 
 from app.separation import (
     DEFAULT_MATRIX,
+    Capacity,
     ClosureWindow,
     Flight,
     build_matrix,
+    find_capacity_violations,
     find_closure_conflicts,
     find_violations,
     required_gap,
@@ -229,3 +231,166 @@ def test_trial_without_windows_keeps_legacy_flags():
     flights = [make("CA1", 0, "M"), make("CA2", 10, "M")]
     items = trial_reschedule(flights, build_matrix(None))
     assert all(i.closure_hit is False and i.closure_window is None for i in items)
+
+
+# ---------- rolling capacity constraint ----------
+
+
+def test_capacity_none_yields_no_violations_and_legacy_trial_fields():
+    flights = [make("CA1", 0, "M"), make("CA2", 10, "M")]
+    assert find_capacity_violations(flights, None) == []
+    items = trial_reschedule(flights, build_matrix(None), capacity=None)
+    assert all(
+        i.capacity_hit is False
+        and i.capacity_anchor is None
+        and i.capacity_window_start is None
+        and i.capacity_window_seconds is None
+        for i in items
+    )
+
+
+def test_capacity_violation_half_open_boundary():
+    # max 2 departures per 60 s. [0,60) may hold F1,F2; F3 at 59 overflows
+    # (anchor F1). F4 at 60 clears F1's window (end excluded), but its own
+    # k-th predecessor is F2@30: [30,90) still holds F2,F3,F4 -> overflows.
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"),
+              make("F3", 59, "M"), make("F4", 60, "M")]
+    violations = find_capacity_violations(flights, Capacity(60, 2))
+    assert [(v.flight_no, v.anchor_flight_no) for v in violations] == [
+        ("F3", "F1"),
+        ("F4", "F2"),
+    ]
+    v = violations[0]
+    assert v.position == 3
+    assert v.window_seconds == 60 and v.max_departures == 2
+    assert v.departures_in_window == 3
+    assert v.anchor_position == 1
+    assert v.anchor_off == dt(0)
+    assert v.window_end == dt(60)
+    assert v.earliest_compliant_off == dt(60)
+    v2 = violations[1]
+    assert v2.anchor_off == dt(30)
+    assert v2.window_end == dt(90)
+    assert v2.earliest_compliant_off == dt(90)
+    assert v2.departures_in_window == 3
+
+
+def test_capacity_violations_follow_stable_order_with_ties():
+    # three flights at the same instant with k=1: 2nd and 3rd overflow;
+    # stable (flight_no) order decides the anchors.
+    flights = [make("B", 100, "M"), make("A", 100, "M"), make("C", 100, "M")]
+    flights = sort_flights(flights)
+    violations = find_capacity_violations(flights, Capacity(60, 1))
+    assert [v.flight_no for v in violations] == ["B", "C"]
+    assert violations[0].anchor_flight_no == "A"
+    assert violations[0].earliest_compliant_off == dt(160)
+    assert violations[1].anchor_flight_no == "B"
+    assert violations[0].departures_in_window == 2
+
+
+def test_capacity_exactly_filled_is_compliant():
+    flights = [make("F1", 0, "M"), make("F2", 60, "M"), make("F3", 120, "M")]
+    assert find_capacity_violations(flights, Capacity(60, 1)) == []
+
+
+def test_capacity_sliding_window_catches_non_adjacent_overflow():
+    # spacing 40 s, window 90 s, k=2: any window may hold at most 2 flights.
+    # F0..F2 span 80 s -> F2 overflows (anchor F0); F1..F3 span 80 s -> F3
+    # overflows (anchor F1) — the window slides, it is not anchored to the
+    # first flight.
+    flights = [make(f"F{i}", 40 * i, "M") for i in range(4)]
+    violations = find_capacity_violations(flights, Capacity(90, 2))
+    assert [(v.flight_no, v.anchor_flight_no) for v in violations] == [
+        ("F2", "F0"),
+        ("F3", "F1"),
+    ]
+    assert violations[1].anchor_off == dt(40)
+    assert violations[1].window_end == dt(130)
+    assert violations[0].departures_in_window == 3
+    assert violations[1].departures_in_window == 3
+
+
+def test_trial_capacity_pushes_overflowing_flight_to_window_end():
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 59, "M")]
+    matrix = {("M", "M"): 0}
+    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 2))
+    assert items[0].delay_seconds == 0 and items[0].capacity_hit is False
+    assert items[1].delay_seconds == 0 and items[1].capacity_hit is False
+    # F3 pushed to anchor(F1).off + 60 = 60
+    assert items[2].adjusted_time == dt(60)
+    assert items[2].delay_seconds == 1
+    assert items[2].capacity_hit is True
+    assert items[2].capacity_anchor == "F1"
+    assert items[2].capacity_window_seconds == 60
+    assert items[2].capacity_max_departures == 2
+    assert items[2].capacity_window_start == dt(0)
+    assert items[2].capacity_window_end == dt(60)
+    # capacity does not masquerade as a wake trigger
+    assert items[2].triggered_by is None
+
+
+def test_trial_capacity_delay_cascades_through_successors():
+    # k=1 (one departure per 60 s): F2 30 -> 60, F3 70 -> 120
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 70, "M")]
+    matrix = {("M", "M"): 0}
+    items = trial_reschedule(flights, matrix, capacity=Capacity(60, 1))
+    assert items[1].adjusted_time == dt(60)
+    assert items[2].adjusted_time == dt(120)
+    assert items[2].delay_seconds == 50
+    assert items[2].capacity_hit is True
+    assert items[2].capacity_anchor == "F2"
+
+
+def test_trial_capacity_push_into_closure_iterates_back_to_capacity():
+    # F3's capacity push lands on the closure [60,90) -> moved to 90;
+    # F4 at 90 (exactly 60 s after F2) then: closure excludes 90? end excluded
+    # so [60,90) does not contain 90; F4 anchor F2@30 earliest 90, OK.
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"),
+              make("F3", 59, "M"), make("F4", 90, "M")]
+    matrix = {("M", "M"): 0}
+    items = trial_reschedule(
+        flights, matrix, [window(60, 90)], Capacity(60, 2)
+    )
+    assert items[2].adjusted_time == dt(90)
+    assert items[2].capacity_hit is True
+    assert items[2].closure_hit is True
+    assert items[2].closure_window == window(60, 90)
+    assert items[3].adjusted_time == dt(90)  # ties allowed: [30,90) excludes F4
+    # final schedule satisfies the rolling limit
+    adjusted = [i.adjusted_time for i in items]
+    for idx in range(2, len(adjusted)):
+        assert (adjusted[idx] - adjusted[idx - 2]).total_seconds() >= 60
+
+
+def test_trial_closure_push_then_capacity_push():
+    # F2 scheduled inside the closure is pushed to its end (90). F3's wake
+    # earliest follows F2 to 90, jumping over the window, so F3 itself never
+    # lands inside the closure; capacity (anchor F1@0, earliest 60) also holds.
+    flights = [make("F1", 0, "M"), make("F2", 40, "M"), make("F3", 60, "M")]
+    matrix = {("M", "M"): 0}
+    items = trial_reschedule(
+        flights, matrix, [window(30, 90)], Capacity(60, 2)
+    )
+    assert items[1].adjusted_time == dt(90)
+    assert items[1].closure_hit is True
+    assert items[2].adjusted_time == dt(90)
+    assert items[2].closure_hit is False
+    assert items[2].triggered_by == "F2"
+    adjusted = [i.adjusted_time for i in items]
+    assert (adjusted[2] - adjusted[0]).total_seconds() >= 60
+
+
+def test_trial_closure_boundary_requires_capacity_further_push():
+    # Capacity pushes F3 to 60, which is exactly a closure start -> the
+    # closure moves it on to 100; re-checked capacity (anchor F1@0 needs 60)
+    # already holds at 100.
+    flights = [make("F1", 0, "M"), make("F2", 30, "M"), make("F3", 59, "M")]
+    matrix = {("M", "M"): 0}
+    items = trial_reschedule(
+        flights, matrix, [window(60, 100)], Capacity(60, 2)
+    )
+    assert items[2].adjusted_time == dt(100)
+    assert items[2].capacity_hit is True
+    assert items[2].closure_hit is True
+    assert items[2].capacity_anchor == "F1"
+    assert items[2].closure_window == window(60, 100)

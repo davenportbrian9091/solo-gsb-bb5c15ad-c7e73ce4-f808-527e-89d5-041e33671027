@@ -441,3 +441,182 @@ def test_batch_roundtrip_with_closures(client):
     item2 = got_t["runways"][0]["items"][1]
     assert item2["closure_hit"] is True
     assert item2["closure_window"]["end"] == "2026-09-18T00:03:30Z"
+
+
+# ---------- rolling capacity constraint ----------
+
+
+CAPACITY_BODY = {
+    "runways": [
+        {
+            "runway": "36L",
+            "flights": [
+                _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                _flight("CA2", "2026-09-18T00:00:30Z", "M"),
+                _flight("CA3", "2026-09-18T00:00:59Z", "M"),  # 3rd in [00:00,01:00)
+                _flight("CA4", "2026-09-18T00:02:00Z", "M"),
+            ],
+            "capacity": {"window_seconds": 60, "max_departures": 2},
+        },
+        {
+            "runway": "18R",
+            "flights": [
+                _flight("MU1", "2026-09-18T00:00:00Z", "M"),
+                _flight("MU2", "2026-09-18T00:00:10Z", "M"),
+            ],
+        },
+    ],
+    "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+}
+
+
+def test_validate_lists_capacity_violations(client):
+    r = client.post("/api/v1/validate", json=CAPACITY_BODY)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["total_capacity_violations"] == 1
+    rw36l = next(rw for rw in data["runways"] if rw["runway"] == "36L")
+    assert rw36l["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    assert rw36l["capacity_violation_count"] == 1
+    cv = rw36l["capacity_violations"][0]
+    assert cv["flight_no"] == "CA3"
+    assert cv["position"] == 3
+    assert cv["window_seconds"] == 60
+    assert cv["max_departures"] == 2
+    assert cv["departures_in_window"] == 3
+    assert cv["anchor_flight_no"] == "CA1"
+    assert cv["anchor_position"] == 1
+    assert cv["window_start"] == "2026-09-18T00:00:00Z"
+    assert cv["window_end"] == "2026-09-18T00:01:00Z"
+    assert cv["earliest_compliant_off"] == "2026-09-18T00:01:00Z"
+
+    # runway without a capacity config gets no capacity fields at all
+    rw18r = next(rw for rw in data["runways"] if rw["runway"] == "18R")
+    assert "capacity" not in rw18r
+    assert "capacity_violations" not in rw18r
+
+
+def test_capacity_fields_absent_when_unspecified(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("CA2", "2026-09-18T00:00:10Z", "M"),
+                ],
+            }
+        ]
+    }
+    v = client.post("/api/v1/validate", json=body).json()
+    assert "total_capacity_violations" not in v
+    rw = v["runways"][0]
+    assert "capacity" not in rw and "capacity_violation_count" not in rw
+
+    t = client.post("/api/v1/trial", json=body).json()
+    assert "capacity" not in t["runways"][0]
+    item = t["runways"][0]["items"][0]
+    assert "capacity_hit" not in item and "capacity_anchor" not in item
+
+
+def test_capacity_config_rejects_non_positive_and_non_integer(client):
+    base_flights = [_flight("CA1", "2026-09-18T00:00:00Z", "M")]
+    for cap in [
+        {"window_seconds": 0, "max_departures": 2},
+        {"window_seconds": 60, "max_departures": 0},
+        {"window_seconds": -5, "max_departures": 2},
+        {"window_seconds": 60.0, "max_departures": 2},
+        {"window_seconds": "60", "max_departures": 2},
+    ]:
+        body = {"runways": [{"runway": "36L", "flights": base_flights, "capacity": cap}]}
+        r = client.post("/api/v1/validate", json=body)
+        assert r.status_code == 422, cap
+
+    # unknown fields stay rejected
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": base_flights,
+                "capacity": {"window_seconds": 60, "max_departures": 2, "extra": 1},
+            }
+        ]
+    }
+    assert client.post("/api/v1/validate", json=body).status_code == 422
+
+
+def test_trial_capacity_defers_flights_and_marks_trigger(client):
+    r = client.post("/api/v1/trial", json=CAPACITY_BODY)
+    assert r.status_code == 200, r.text
+    rw = next(x for x in r.json()["runways"] if x["runway"] == "36L")
+    assert rw["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    items = {i["flight_no"]: i for i in rw["items"]}
+
+    assert items["CA1"]["adjusted_off"] == "2026-09-18T00:00:00Z"
+    assert items["CA1"]["capacity_hit"] is False
+    assert items["CA1"]["capacity_anchor"] is None
+    assert items["CA1"]["capacity_window"] is None
+    # CA3 pushed from 00:00:59 to 00:01:00 against the window anchored at CA1
+    assert items["CA3"]["adjusted_off"] == "2026-09-18T00:01:00Z"
+    assert items["CA3"]["delay_seconds"] == 1
+    assert items["CA3"]["capacity_hit"] is True
+    assert items["CA3"]["capacity_anchor"] == "CA1"
+    assert items["CA3"]["capacity_window_seconds"] == 60
+    assert items["CA3"]["capacity_max_departures"] == 2
+    assert items["CA3"]["capacity_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:00Z",
+    }
+    # CA4 at 00:02:00 is clear of every 60 s window -> untouched
+    assert items["CA4"]["delay_seconds"] == 0
+    assert items["CA4"]["capacity_hit"] is False
+
+
+def test_trial_capacity_then_closure_iteration(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("CA2", "2026-09-18T00:00:30Z", "M"),
+                    _flight("CA3", "2026-09-18T00:00:59Z", "M"),
+                ],
+                "closures": [
+                    {"start": "2026-09-18T00:01:00Z", "end": "2026-09-18T00:01:40Z"}
+                ],
+                "capacity": {"window_seconds": 60, "max_departures": 2},
+            }
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+    }
+    data = client.post("/api/v1/trial", json=body).json()
+    item3 = data["runways"][0]["items"][2]
+    # capacity push to 01:00 lands exactly on the closure start -> 01:40
+    assert item3["adjusted_off"] == "2026-09-18T00:01:40Z"
+    assert item3["capacity_hit"] is True
+    assert item3["closure_hit"] is True
+    assert item3["capacity_window"]["end"] == "2026-09-18T00:01:00Z"
+    assert item3["closure_window"]["start"] == "2026-09-18T00:01:00Z"
+
+
+def test_batch_roundtrip_preserves_capacity(client):
+    v = client.post("/api/v1/validate", json=CAPACITY_BODY).json()
+    got_v = client.get(f"/api/v1/batches/{v['batch_id']}").json()
+    assert got_v["total_capacity_violations"] == 1
+    rw = next(x for x in got_v["runways"] if x["runway"] == "36L")
+    assert rw["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    assert rw["capacity_violations"] == next(
+        x for x in v["runways"] if x["runway"] == "36L"
+    )["capacity_violations"]
+    # runway without capacity keeps the lean shape on replay too
+    rw18r = next(x for x in got_v["runways"] if x["runway"] == "18R")
+    assert "capacity" not in rw18r
+
+    t = client.post("/api/v1/trial", json=CAPACITY_BODY).json()
+    got_t = client.get(f"/api/v1/batches/{t['batch_id']}").json()
+    t36l = next(x for x in got_t["runways"] if x["runway"] == "36L")
+    assert t36l["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    assert t36l["items"] == next(
+        x for x in t["runways"] if x["runway"] == "36L"
+    )["items"]

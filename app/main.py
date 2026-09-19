@@ -35,11 +35,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="跑道离场尾流间隔校验 API",
     description=(
-        "提交按跑道分组的航班计划（可附带跑道临时关闭窗口），校验相邻离场航班的"
-        "尾流间隔违规与落入关闭窗口的航班，并支持在不改动原计划的前提下试排"
-        "（向后级联延误，自动避开关闭窗口）。"
+        "提交按跑道分组的航班计划（可附带跑道临时关闭窗口与滚动容量约束），"
+        "校验相邻离场航班的尾流间隔违规、落入关闭窗口的航班与滚动容量超限，"
+        "并支持在不改动原计划的前提下试排（向后级联延误，自动满足容量并"
+        "避开关闭窗口）。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -79,27 +80,47 @@ def _window_out(window: ClosureWindow) -> dict:
     return {"start": window.start, "end": window.end}
 
 
+def _capacity_out(capacity) -> dict:
+    return {
+        "window_seconds": capacity.window_seconds,
+        "max_departures": capacity.max_departures,
+    }
+
+
 @app.post("/api/v1/validate", response_model=ValidateResponse, tags=["wake"])
 def validate(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> ValidateResponse:
-    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规，
-    以及计划离场时刻落入关闭窗口的航班及其命中窗口。"""
-    payloads, matrix, windows, violations, conflicts = run_validate(req)
+    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规、
+    落入关闭窗口的航班及其命中窗口，以及滚动容量约束的超限航班、
+    触发窗口与最早合规时刻。"""
+    (
+        payloads,
+        matrix,
+        windows,
+        capacities,
+        violations,
+        conflicts,
+        capacity_violations,
+    ) = run_validate(req)
     batch_id = save_batch(
         db,
         mode="validate",
         matrix=matrix,
         runway_payloads=payloads,
         closures_by_runway=windows,
+        capacities_by_runway=capacities,
         violations_by_runway=violations,
         closure_conflicts_by_runway=conflicts,
+        capacity_violations_by_runway=capacity_violations,
     )
 
     runway_reports: list[RunwayReportOut] = []
     for runway, flights in payloads.items():
         vlist = violations[runway]
         clist = conflicts[runway]
+        capacity = capacities.get(runway)
+        cvlist = capacity_violations[runway]
         runway_reports.append(
             RunwayReportOut(
                 runway=runway,
@@ -136,6 +157,26 @@ def validate(
                     }
                     for c in clist
                 ],
+                has_capacity=capacity is not None,
+                capacity=_capacity_out(capacity) if capacity is not None else None,
+                capacity_violation_count=len(cvlist),
+                capacity_violations=[
+                    {
+                        "flight_no": cv.flight_no,
+                        "wake": cv.wake,
+                        "scheduled_off": cv.scheduled_off,
+                        "position": cv.position,
+                        "window_seconds": cv.window_seconds,
+                        "max_departures": cv.max_departures,
+                        "departures_in_window": cv.departures_in_window,
+                        "anchor_flight_no": cv.anchor_flight_no,
+                        "anchor_position": cv.anchor_position,
+                        "window_start": cv.anchor_off,
+                        "window_end": cv.window_end,
+                        "earliest_compliant_off": cv.earliest_compliant_off,
+                    }
+                    for cv in cvlist
+                ],
             )
         )
 
@@ -146,6 +187,10 @@ def validate(
         total_flights=sum(len(f) for f in payloads.values()),
         total_violations=sum(len(v) for v in violations.values()),
         total_closure_conflicts=sum(len(c) for c in conflicts.values()),
+        has_capacity=bool(capacities),
+        total_capacity_violations=sum(
+            len(cv) for cv in capacity_violations.values()
+        ),
         runways=runway_reports,
     )
 
@@ -154,15 +199,16 @@ def validate(
 def trial(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> TrialResponse:
-    """保持原排序逐项推迟到最早安全时刻（满足尾流间隔且避开关闭窗口）；
-    延误向后级联，原计划不变。"""
-    payloads, matrix, windows, trials = run_trial(req)
+    """保持原排序逐项推迟到最早安全时刻（满足尾流间隔、滚动容量约束且
+    避开关闭窗口）；延误向后级联，原计划不变。"""
+    payloads, matrix, windows, capacities, trials = run_trial(req)
     batch_id = save_batch(
         db,
         mode="trial",
         matrix=matrix,
         runway_payloads=payloads,
         closures_by_runway=windows,
+        capacities_by_runway=capacities,
         trial_by_runway=trials,
     )
 
@@ -174,6 +220,7 @@ def trial(
         rw_delay = sum(i.delay_seconds for i in items)
         total_delayed += len(delayed)
         total_delay += rw_delay
+        capacity = capacities.get(runway)
         runway_trials.append(
             RunwayTrialOut(
                 runway=runway,
@@ -183,6 +230,8 @@ def trial(
                 delayed_count=len(delayed),
                 total_delay_seconds=rw_delay,
                 max_delay_seconds=max((i.delay_seconds for i in items), default=0),
+                has_capacity=capacity is not None,
+                capacity=_capacity_out(capacity) if capacity is not None else None,
                 items=[
                     {
                         "position": i.position,
@@ -196,6 +245,19 @@ def trial(
                         "closure_window": (
                             _window_out(i.closure_window) if i.closure_window else None
                         ),
+                        "capacity_hit": i.capacity_hit,
+                        "capacity_window_seconds": i.capacity_window_seconds,
+                        "capacity_max_departures": i.capacity_max_departures,
+                        "capacity_anchor": i.capacity_anchor,
+                        "capacity_window": (
+                            {
+                                "start": i.capacity_window_start,
+                                "end": i.capacity_window_end,
+                            }
+                            if i.capacity_window_start is not None
+                            else None
+                        ),
+                        "has_capacity": capacity is not None,
                     }
                     for i in items
                 ],
